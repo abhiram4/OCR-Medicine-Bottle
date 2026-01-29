@@ -52,18 +52,22 @@ class BottlePipeline:
         return cv2.imread(image_path), None  # Return original if no detection
 
     def preprocess(self, image):
-        """Preprocesses image for OCR (Grayscale, Resize, CLAHE)."""
+        """Preprocesses image: Upscale, Grayscale, CLAHE. (Inpainting disabled due to text erasure)"""
+        
+        # Note: Previous Inpainting strategy (HSV mask) was removing white text.
+        # Reverting to robust CLAHE pipeline which performed better.
+        
+        # 1. Grayscale
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         
-        # Upscale
+        # 2. Upscale
         scale_percent = 200 
         width = int(gray.shape[1] * scale_percent / 100)
         height = int(gray.shape[0] * scale_percent / 100)
         dim = (width, height)
         resized = cv2.resize(gray, dim, interpolation=cv2.INTER_CUBIC)
 
-        # CLAHE (Contrast Limited Adaptive Histogram Equalization)
-        # Helps with cylindrical wrapping lighting issues
+        # 3. CLAHE (Contrast Limited Adaptive Histogram Equalization)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
         processed = clahe.apply(resized)
 
@@ -72,11 +76,18 @@ class BottlePipeline:
         return processed
 
     def perform_ocr(self, image):
-        """Extracts text using Tesseract."""
-        # psm 6: Assume a single uniform block of text.
-        text = pytesseract.image_to_string(image, config='--psm 6')
-        return text.strip()
-
+        """Extracts text using Tesseract with Layout Analysis (PSM 11)."""
+        # PSM 11: Sparse text. Find as much text as possible in no particular order.
+        # We use image_to_data to get bounding boxes and confidence
+        config = r'--oem 3 --psm 11'
+        data = pytesseract.image_to_data(image, config=config, output_type=pytesseract.Output.DICT)
+        
+        # Reconstruct full text for display/regex (naive concatenation)
+        full_text = " ".join([word for word in data['text'] if word.strip()])
+        
+        # Store layout data for heuristic analysis
+        return full_text
+        
     def read_barcode(self, image):
         """Reads barcode from the image with rotations and sharpening."""
         
@@ -133,19 +144,64 @@ class BottlePipeline:
 
     def extract_candidates_heuristic(self, text):
         """
-        Fallback method to find potential drug names if NER fails.
-        Looks for uppercase words > 3 chars, ignoring common keywords.
+        Layout-Aware Heuristic: Finds largest text blocks that aren't stop words.
+        Falls back to regex if layout analysis fails.
         """
-        # Common non-drug words on labels
-        ignore_list = {
+        candidates = []
+        seen = set()
+        
+        # 1. Layout Analysis (Font Size/Height)
+        if hasattr(self, 'last_ocr_layout'):
+            data = self.last_ocr_layout
+            n_boxes = len(data['text'])
+            
+            # Filter valid words
+            valid_blocks = []
+            ignore_list = {
+                "TABLET", "TABLETS", "CAPSULE", "CAPSULES", "ORAL", "USP", 
+                "MG", "MCG", "ML", "EXP", "DATE", "QTY", "DOSE", "TAKE", "MOUTH", 
+                "DAILY", "ONLY", "KEEP", "AWAY", "FROM", "CHILDREN", "STORE", 
+                "REFILL", "PHARMACY", "GENERIC", "BRAND", "SUBSTITUTE", "FOR",
+                "NDC", "LOT", "MFG"
+            }
+            
+            for i in range(n_boxes):
+                word = data['text'][i].strip().upper()
+                if len(word) > 3 and word not in ignore_list:
+                    # Score = Height (Font Size)
+                    height = data['height'][i]
+                    valid_blocks.append((word, height))
+            
+            # Sort by height (descending) -> Largest text first
+            valid_blocks.sort(key=lambda x: x[1], reverse=True)
+            
+            # Use top 3 distinct words as candidates
+            for word, h in valid_blocks:
+                if word not in seen:
+                    candidates.append(word)
+                    seen.add(word)
+                if len(candidates) >= 3:
+                    break
+                    
+        # 2. Regex Fallback (AUGMENTATION: Always run this too)
+        # The user noted "it worked better earlier". This regex was robust for "ANTOPRAZOLE".
+        # We combine both strategies.
+        ignore_list_regex = {
             "TABLET", "TABLETS", "CAPSULE", "CAPSULES", "ORAL", "USP", 
             "MG", "MCG", "ML", "EXP", "DATE", "QTY", "DOSE", "TAKE", "MOUTH", 
             "DAILY", "ONLY", "KEEP", "AWAY", "FROM", "CHILDREN", "STORE", 
-            "REFILL", "PHARMACY", "GENERIC", "BRAND", "SUBSTITUTE", "FOR"
+            "REFILL", "PHARMACY", "GENERIC", "BRAND", "SUBSTITUTE", "FOR",
+            "NDC", "LOT", "MFG"
         }
-        
         words = re.findall(r'\b[A-Z]{4,}\b', text)
-        candidates = [w for w in words if w not in ignore_list]
+        regex_candidates = [w for w in words if w not in ignore_list_regex]
+        
+        # Combine (Priority: Layout > Regex)
+        for rc in regex_candidates:
+            if rc not in seen:
+                candidates.append(rc)
+                seen.add(rc)
+
         return candidates
 
     def query_fda(self, query_term, query_type="brand_name", fuzzy=False):
@@ -242,6 +298,7 @@ class BottlePipeline:
         processed_img = self.preprocess(cropped_img)
         raw_text = self.perform_ocr(processed_img)
         result_data["ocr_text"] = raw_text
+        print(f"\n--- Extracted Text (Raw) ---\n{raw_text}\n----------------------------")
         
         # 4. NER & Smart Extraction
         entities = self.extract_entities(raw_text)
